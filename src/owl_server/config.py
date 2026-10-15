@@ -40,6 +40,39 @@ def _bool(value: str | None, default: bool) -> bool:
     return value.strip().lower() in ("1", "true", "yes", "on")
 
 
+#: Every switch that weakens security has a deliberately long name and is off by default. Anyone who
+#: sets one makes a conscious decision; each active flag is logged as a warning at start-up.
+INSECURE_FLAGS = {
+    "ALLOW_INSECURE_OIDC_OVER_HTTP": "OIDC issuer is not https:// (tokens and codes travel unencrypted)",
+    "ALLOW_INSECURE_OAUTH_OVER_HTTP": "OAuth endpoints are not https:// (codes and tokens travel unencrypted)",
+    "ALLOW_INSECURE_LDAP_WITHOUT_TLS": "plain ldap:// without StartTLS (passwords travel unencrypted)",
+    "ALLOW_INSECURE_DISABLE_OIDC_TLS_VERIFICATION": "OIDC server certificate is NOT verified",
+    "ALLOW_INSECURE_DISABLE_OAUTH_TLS_VERIFICATION": "OAuth server certificate is NOT verified",
+    "ALLOW_INSECURE_DISABLE_LDAP_TLS_VERIFICATION": "LDAP server certificate is NOT verified",
+}
+
+
+def _insecure(name: str, env: dict[str, str] | None) -> bool:
+    """True when the long ``OWL_SERVER_<name>`` flag is set (see :data:`INSECURE_FLAGS`)."""
+    return _bool(_get(name, env=env), False)
+
+
+def active_insecure_flags(env: dict[str, str] | None = None) -> list[str]:
+    return [f"{PREFIX}{n}: {why}" for n, why in INSECURE_FLAGS.items() if _insecure(n, env)]
+
+
+def _verify(provider: str, env: dict[str, str] | None) -> bool:
+    """TLS verification is always on; switching it off needs the long flag."""
+    if _insecure(f"ALLOW_INSECURE_DISABLE_{provider}_TLS_VERIFICATION", env):
+        return False
+    if not _bool(_get(f"{provider}_VERIFY_TLS", env=env), True):
+        raise ConfigError(
+            f"{PREFIX}{provider}_VERIFY_TLS is no longer a switch. To turn certificate checking off "
+            f"(never do this in production) set {PREFIX}ALLOW_INSECURE_DISABLE_{provider}_TLS_VERIFICATION=true"
+        )
+    return True
+
+
 def _list(value: str | None, sep: str = ",") -> list[str]:
     return [v.strip() for v in (value or "").split(sep) if v.strip()]
 
@@ -212,8 +245,11 @@ def _oidc(env: dict[str, str] | None) -> OidcSettings | None:
     client_id, redirect = _get("OIDC_CLIENT_ID", env=env), _get("OIDC_REDIRECT_URI", env=env)
     if not client_id or not redirect:
         raise ConfigError("OIDC needs OWL_SERVER_OIDC_CLIENT_ID and OWL_SERVER_OIDC_REDIRECT_URI")
-    if not issuer.startswith("https://") and not _bool(_get("OIDC_ALLOW_INSECURE", env=env), False):
-        raise ConfigError("OWL_SERVER_OIDC_ISSUER must be an https:// URL")
+    if not issuer.startswith("https://") and not _insecure("ALLOW_INSECURE_OIDC_OVER_HTTP", env):
+        raise ConfigError(
+            "OWL_SERVER_OIDC_ISSUER must be an https:// URL "
+            "(lab only: OWL_SERVER_ALLOW_INSECURE_OIDC_OVER_HTTP=true)"
+        )
     return OidcSettings(
         issuer=issuer.rstrip("/"),
         client_id=client_id,
@@ -224,7 +260,7 @@ def _oidc(env: dict[str, str] | None) -> OidcSettings | None:
         username_claim=_get("OIDC_USERNAME_CLAIM", "preferred_username", env)
         or "preferred_username",
         role_claim=_get("OIDC_ROLE_CLAIM", env=env),
-        verify_tls=_bool(_get("OIDC_VERIFY_TLS", env=env), True),
+        verify_tls=_verify("OIDC", env),
         label=_get("OIDC_LABEL", "Single sign-on", env) or "Single sign-on",
         mapping=_mapping("OIDC", env),
     )
@@ -255,10 +291,13 @@ def _oauth(env: dict[str, str] | None) -> OAuthSettings | None:
         pick("TOKEN_URL", "token_url"),
         pick("USERINFO_URL", "userinfo_url"),
     ]
-    if any(not u.startswith("https://") for u in urls) and not _bool(
-        _get("OAUTH_ALLOW_INSECURE", env=env), False
+    if any(not u.startswith("https://") for u in urls) and not _insecure(
+        "ALLOW_INSECURE_OAUTH_OVER_HTTP", env
     ):
-        raise ConfigError("OAuth endpoints must be https:// URLs")
+        raise ConfigError(
+            "OAuth endpoints must be https:// URLs "
+            "(lab only: OWL_SERVER_ALLOW_INSECURE_OAUTH_OVER_HTTP=true)"
+        )
     return OAuthSettings(
         client_id=client_id,
         client_secret=_get("OAUTH_CLIENT_SECRET", env=env),
@@ -274,7 +313,7 @@ def _oauth(env: dict[str, str] | None) -> OAuthSettings | None:
         groups_field=_get("OAUTH_GROUPS_FIELD", env=env),
         allowed_users=_list(_get("OAUTH_ALLOWED_USERS", env=env)),
         label=_get("OAUTH_LABEL", base.get("label", "OAuth login"), env) or "OAuth login",
-        verify_tls=_bool(_get("OAUTH_VERIFY_TLS", env=env), True),
+        verify_tls=_verify("OAUTH", env),
         mapping=_mapping("OAUTH", env),
     )
 
@@ -285,12 +324,12 @@ def _ldap(env: dict[str, str] | None) -> LdapSettings | None:
         return None
     if not url.lower().startswith(("ldaps://", "ldap://")):
         raise ConfigError("OWL_SERVER_LDAP_URL must start with ldaps:// or ldap://")
-    insecure_ok = _bool(_get("LDAP_ALLOW_INSECURE", env=env), False)
+    insecure_ok = _insecure("ALLOW_INSECURE_LDAP_WITHOUT_TLS", env)
     start_tls = _bool(_get("LDAP_START_TLS", env=env), False)
     if url.lower().startswith("ldap://") and not start_tls and not insecure_ok:
         raise ConfigError(
             "Plain ldap:// would send passwords unencrypted: use ldaps://, "
-            "OWL_SERVER_LDAP_START_TLS=true, or OWL_SERVER_LDAP_ALLOW_INSECURE=true for a lab"
+            "OWL_SERVER_LDAP_START_TLS=true, or OWL_SERVER_ALLOW_INSECURE_LDAP_WITHOUT_TLS=true for a lab"
         )
     missing = [
         n for n in ("BIND_DN", "BIND_PASSWORD", "USER_BASE") if not _get(f"LDAP_{n}", env=env)
@@ -310,7 +349,7 @@ def _ldap(env: dict[str, str] | None) -> LdapSettings | None:
         email_attr=_get("LDAP_EMAIL_ATTR", "mail", env) or "mail",
         group_attr=_get("LDAP_GROUP_ATTR", "memberOf", env) or "memberOf",
         start_tls=start_tls,
-        verify_tls=_bool(_get("LDAP_VERIFY_TLS", env=env), True),
+        verify_tls=_verify("LDAP", env),
         ca_file=_get("LDAP_CA_FILE", env=env),
         timeout=int(_get("LDAP_TIMEOUT", "8", env) or 8),
         label=_get("LDAP_LABEL", "Directory login", env) or "Directory login",

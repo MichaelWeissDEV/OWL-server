@@ -30,6 +30,14 @@ owl-server = "owl_server.cli:main"
 
 [dependency-groups]
 dev = ["pytest>=8", "ruff>=0.6", "mypy>=1.10", "cryptography>=42"]
+docs = [
+    "sphinx>=8",
+    "furo>=2024.8",
+    "myst-parser>=4",
+    "sphinx-copybutton>=0.5",
+    "sphinx-design>=0.6",
+    "sphinxcontrib-mermaid>=1.0",
+]
 
 # Local development uses the sibling checkout of OWL (the shared core: data model, hashing,
 # validation). Container and CI builds install owl from git instead (see Dockerfile).

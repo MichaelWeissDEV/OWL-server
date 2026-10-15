@@ -86,6 +86,18 @@ jobs:
           npx playwright install --with-deps chromium
           npm run test:e2e
 
+  docs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - run: uv sync --locked --only-group docs
+      - run: uv run sphinx-build -W --keep-going -b html docs docs/_build/html
+      - uses: actions/upload-artifact@v4
+        with:
+          name: docs-html
+          path: docs/_build/html
+
   docker:
     runs-on: ubuntu-latest
     needs: checks

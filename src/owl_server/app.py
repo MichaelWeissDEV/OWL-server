@@ -16,7 +16,7 @@ from sqlalchemy.engine import Engine
 
 from owl_server import __version__, access, db
 from owl_server import models as m
-from owl_server.config import Settings
+from owl_server.config import Settings, active_insecure_flags
 from owl_server.deps import AppState
 from owl_server.ldap_auth import LdapService
 from owl_server.oauth import OAuthService
@@ -146,6 +146,9 @@ def create_app(
             "Secure it in the dashboard (Settings) or set OWL_SERVER_OPEN=false.",
             reason,
         )
+
+    for flag in active_insecure_flags():
+        log.warning("INSECURE SETTING ENABLED - %s", flag)
 
     @app.exception_handler(OwlError)
     async def owl_error(_request: Request, exc: OwlError) -> JSONResponse:

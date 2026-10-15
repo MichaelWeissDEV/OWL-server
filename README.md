@@ -12,7 +12,7 @@
   <img alt="Python 3.13+" src="https://img.shields.io/badge/python-3.13%2B-3776AB?logo=python&amp;logoColor=white">
   <img alt="PostgreSQL" src="https://img.shields.io/badge/database-PostgreSQL-336791?logo=postgresql&amp;logoColor=white">
   <a href="https://github.com/MichaelWeissDEV/owl-server/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/MichaelWeissDEV/owl-server/actions/workflows/ci.yml/badge.svg"></a>
-  <a href="https://owl-skills.readthedocs.io"><img alt="Documentation" src="https://img.shields.io/badge/docs-Read%20the%20Docs-8CA1AF?logo=readthedocs&amp;logoColor=white"></a>
+  <a href="https://owl-server.readthedocs.io"><img alt="Documentation" src="https://img.shields.io/badge/docs-Read%20the%20Docs-8CA1AF?logo=readthedocs&amp;logoColor=white"></a>
   <a href="https://github.com/MichaelWeissDEV/OWL"><img alt="OWL CLI" src="https://img.shields.io/badge/client-OWL%20CLI-8b5a2b"></a>
 </p>
 
@@ -67,8 +67,14 @@ internal network and is never published.
 
 ## Documentation
 
-Deployment, authentication, roles, OpenID Connect, the HTTP API and operations are documented in the
-[OWL documentation](https://owl-skills.readthedocs.io) (section *Server*).
+Full documentation: **<https://owl-server.readthedocs.io>** (sources in [`docs/`](docs/index.md)):
+getting started, dashboard, users and roles, identity providers, configuration (including the
+`ALLOW_INSECURE_…` switches), the HTTP API, deployment and operations. The OWL command line is
+documented at <https://owl-skills.readthedocs.io>.
+
+```bash
+uv sync --group docs && uv run sphinx-build -W -b html docs docs/_build/html
+```
 
 ## Development
 

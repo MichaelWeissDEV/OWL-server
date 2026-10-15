@@ -694,9 +694,32 @@ def test_ldap_start_tls_and_lab_override_are_accepted():
         {**base, "OWL_SERVER_LDAP_URL": "ldap://x", "OWL_SERVER_LDAP_START_TLS": "true"}
     ).ldap.start_tls
     assert load_settings(
-        {**base, "OWL_SERVER_LDAP_URL": "ldap://x", "OWL_SERVER_LDAP_ALLOW_INSECURE": "true"}
+        {
+            **base,
+            "OWL_SERVER_LDAP_URL": "ldap://x",
+            "OWL_SERVER_ALLOW_INSECURE_LDAP_WITHOUT_TLS": "true",
+        }
     ).ldap
     assert (
         load_settings({"OWL_SERVER_DATABASE_URL": "x"}).open is None
         and load_settings({"OWL_SERVER_DATABASE_URL": "x"}).local_accounts
     )
+
+
+def test_insecure_switches_need_the_long_flag_and_are_reported():
+    from owl_server.config import ConfigError, active_insecure_flags
+
+    base = {
+        "OWL_SERVER_DATABASE_URL": "x",
+        "OWL_SERVER_LDAP_URL": "ldaps://x",
+        "OWL_SERVER_LDAP_BIND_DN": "a",
+        "OWL_SERVER_LDAP_BIND_PASSWORD": "b",
+        "OWL_SERVER_LDAP_USER_BASE": "c",
+    }
+    with pytest.raises(ConfigError, match="ALLOW_INSECURE_DISABLE_LDAP_TLS_VERIFICATION"):
+        load_settings({**base, "OWL_SERVER_LDAP_VERIFY_TLS": "false"})
+    off = load_settings({**base, "OWL_SERVER_ALLOW_INSECURE_DISABLE_LDAP_TLS_VERIFICATION": "true"})
+    assert off.ldap.verify_tls is False and load_settings(base).ldap.verify_tls is True
+    flags = active_insecure_flags({"OWL_SERVER_ALLOW_INSECURE_LDAP_WITHOUT_TLS": "1"})
+    assert len(flags) == 1 and "passwords" in flags[0]
+    assert active_insecure_flags({}) == []
