@@ -1,0 +1,7 @@
+.git
+.venv
+__pycache__
+*.sqlite3
+.env
+tests
+dashboard/node_modules

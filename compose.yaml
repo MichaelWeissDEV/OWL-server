@@ -1,0 +1,60 @@
+# OWL Server without the dashboard:  PostgreSQL <- OWL API
+#   cp .env.example .env   # fill in POSTGRES_PASSWORD and OWL_SERVER_ADMIN_TOKEN
+#   docker compose up -d --build
+# The dashboard (a separate, optional service) is added in its own compose profile.
+name: owl-server
+
+services:
+  db:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: owl
+      POSTGRES_DB: owl
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U owl -d owl"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+    networks: [backend]          # not published to the host, not reachable from outside
+    stop_grace_period: 30s
+    deploy:
+      resources:
+        limits: {memory: 512m}
+
+  api:
+    build:
+      context: .
+      args:
+        OWL_SPEC: ${OWL_SPEC:-owl @ https://github.com/MichaelWeissDEV/OWL/archive/refs/heads/master.tar.gz}
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy   # the API starts only when PostgreSQL accepts connections
+    environment:
+      OWL_SERVER_DATABASE_URL: postgresql://owl:${POSTGRES_PASSWORD}@db:5432/owl
+      OWL_SERVER_ADMIN_TOKEN: ${OWL_SERVER_ADMIN_TOKEN:?set OWL_SERVER_ADMIN_TOKEN in .env}
+      OWL_SERVER_MODE: ${OWL_SERVER_MODE:-mixed}
+      OWL_SERVER_LOCAL_ACCOUNTS: ${OWL_SERVER_LOCAL_ACCOUNTS:-false}
+      OWL_SERVER_AUTO_MIGRATE: "true"
+    ports:
+      - "127.0.0.1:${OWL_SERVER_PORT:-8765}:8765"   # localhost only; terminate TLS in a reverse proxy
+    networks: [backend, default]
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    stop_grace_period: 20s
+    deploy:
+      resources:
+        limits: {memory: 512m}
+
+networks:
+  backend:
+    internal: true               # the database network has no route to the outside
+
+volumes:
+  pgdata:
