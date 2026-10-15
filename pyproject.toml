@@ -3,6 +3,8 @@ name = "owl-server"
 version = "0.1.0"
 description = "OWL Server - a self-hostable, PostgreSQL-backed skill registry for OWL"
 readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
 requires-python = ">=3.13"
 classifiers = [
     "Development Status :: 3 - Alpha",

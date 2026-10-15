@@ -7,6 +7,7 @@
 <p align="center"><b>A self-hostable, PostgreSQL-backed skill registry for <a href="https://github.com/MichaelWeissDEV/OWL">OWL</a>.</b></p>
 
 <p align="center">
+  <a href="LICENSE"><img alt="License: Apache-2.0" src="https://img.shields.io/badge/license-Apache--2.0-blue"></a>
   <img alt="Development status: Alpha" src="https://img.shields.io/badge/status-alpha-orange">
   <img alt="Version 0.1.0" src="https://img.shields.io/badge/version-0.1.0-blue">
   <img alt="Python 3.13+" src="https://img.shields.io/badge/python-3.13%2B-3776AB?logo=python&amp;logoColor=white">
@@ -92,5 +93,6 @@ Layout: `src/owl_server/` (config, models, repository, accounts, external/oidc/o
 
 ## License
 
-No license has been chosen yet (all rights reserved by the author) - see the note in the
-[OWL repository](https://github.com/MichaelWeissDEV/OWL#license).
+Copyright 2026 Michael Weiss. Licensed under the [Apache License 2.0](LICENSE) (see also [`NOTICE`](NOTICE)).
+The copyright stays with the author; the license lets everyone use, modify, fork and redistribute the
+code under its terms, including keeping the copyright and license notices.
