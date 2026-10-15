@@ -10,7 +10,7 @@ import zipfile
 from pathlib import Path
 from typing import Annotated, Any
 
-from fastapi import APIRouter, Body, HTTPException, Query, Request, Response
+from fastapi import APIRouter, Body, File, Form, HTTPException, Query, Request, Response, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
 from owl.models import InvalidSkill, OwlError, SearchQuery, Skill
 from starlette.background import BackgroundTask
@@ -248,6 +248,211 @@ def export_registry(ctx: RegistryDep) -> FileResponse:
         filename=f"{ctx.registry.slug}.zip",
         background=BackgroundTask(shutil.rmtree, tmp, ignore_errors=True),
     )
+
+
+# -- importing (the server parses SKILL.md with OWL's own code) --------------------------------------
+
+
+@router.post("/skills/import")
+def import_skill(
+    request: Request, ctx: RegistryDep, body: Annotated[dict[str, Any], Body()]
+) -> JSONResponse:
+    """Create or update a skill from raw ``SKILL.md`` text (what the dashboard's editor and upload use).
+
+    ``{"content": "---\\nname: x\\n...", "files": {path: base64}, "author": "me", "overrides": {...}}``.
+    Parsing, defaults and validation are OWL's, so the result is exactly what ``owl add`` would store.
+    """
+    import base64
+
+    from owl.fsutil import safe_relpath
+    from owl.parsing import skill_from_markdown
+
+    ctx.require("publisher")
+    content = body.get("content")
+    if not isinstance(content, str) or not content.strip():
+        raise HTTPException(422, "content (the SKILL.md text) is required")
+    try:
+        files = {safe_relpath(p): base64.b64decode(b) for p, b in (body.get("files") or {}).items()}
+    except (OwlError, ValueError, TypeError) as exc:
+        raise HTTPException(422, f"Malformed files: {exc}") from exc
+    overrides = {
+        k: v
+        for k, v in (body.get("overrides") or {}).items()
+        if k in ("version", "description", "tags", "topics", "author")
+    }
+    default_author = str(body.get("author") or ctx.principal.username or "local").lower()
+    skill, problems = skill_from_markdown(
+        content,
+        default_author=default_author,
+        fallback_name=str(body.get("name") or ""),
+        files=files,
+        overlay=overrides,
+    )
+    if problems:
+        raise HTTPException(422, "; ".join(problems))
+    stored, outcome = ctx.repo.upsert(skill, ctx.principal.actor)
+    audit.record(
+        ctx.session,
+        ctx.principal,
+        f"skill.{outcome}",
+        f"{ctx.registry.slug}:{stored.ref}",
+        f"sha256={stored.sha256} via import",
+        client_ip(request),
+    )
+    ctx.session.commit()
+    return JSONResponse(
+        {**stored.to_dict(), "outcome": outcome}, status_code=201 if outcome == "created" else 200
+    )
+
+
+@router.post("/import-zip")
+def import_zip(
+    request: Request,
+    ctx: RegistryDep,
+    file: Annotated[UploadFile, File()],
+    author: Annotated[str, Form()] = "",
+) -> dict[str, Any]:
+    """Import every skill found in a zip archive (extracted with OWL's strict path/size checks)."""
+    from owl.discovery import discover, extract_zip
+
+    ctx.require("publisher")
+    results: list[dict[str, Any]] = []
+    with tempfile.TemporaryDirectory(prefix="owl-import-") as tmp:
+        archive = Path(tmp) / "upload.zip"
+        with open(archive, "wb") as out:
+            while chunk := file.file.read(1024 * 1024):
+                out.write(chunk)
+        target = Path(tmp) / "x"
+        target.mkdir()
+        try:
+            extract_zip(archive, target)
+        except (OwlError, zipfile.BadZipFile) as exc:
+            raise HTTPException(422, f"Not a usable zip archive: {exc}") from exc
+        default_author = (author or ctx.principal.username or "local").lower()
+        for cand in discover(target, default_author=default_author):
+            entry: dict[str, Any] = {"name": cand.name, "path": cand.relative}
+            if cand.status != "valid" or cand.skill is None:
+                entry.update(status="invalid", problems=cand.problems)
+            else:
+                try:
+                    stored, outcome = ctx.repo.upsert(cand.skill, ctx.principal.actor)
+                    entry.update(status=outcome, ref=stored.ref, sha256=stored.sha256)
+                    audit.record(
+                        ctx.session,
+                        ctx.principal,
+                        f"skill.{outcome}",
+                        f"{ctx.registry.slug}:{stored.ref}",
+                        "via zip import",
+                        client_ip(request),
+                    )
+                except InvalidSkill as exc:
+                    entry.update(status="invalid", problems=[str(exc)])
+            results.append(entry)
+    ctx.session.commit()
+    if not results:
+        raise HTTPException(422, "No SKILL.md found in the archive")
+    return {
+        "results": results,
+        "imported": sum(
+            1 for r in results if r["status"] in ("created", "new-version", "rollback")
+        ),
+        "invalid": sum(1 for r in results if r["status"] == "invalid"),
+    }
+
+
+# -- files and activity --------------------------------------------------------------------------
+
+
+def _file_map(skill: Skill) -> dict[str, bytes]:
+    files = {
+        "SKILL.md": skill.content.encode("utf-8"),
+        "skill.json": (json.dumps(skill.meta(), indent=2, ensure_ascii=False) + "\n").encode(
+            "utf-8"
+        ),
+    }
+    files.update(skill.files)
+    return files
+
+
+def _is_text(data: bytes) -> bool:
+    try:
+        data.decode("utf-8")
+    except UnicodeDecodeError:
+        return False
+    return b"\x00" not in data
+
+
+@router.get("/skills/{author}/{name}/files")
+def list_files(
+    ctx: RegistryDep, author: str, name: str, version: str | None = None
+) -> list[dict[str, Any]]:
+    import hashlib
+
+    skill = ctx.repo.get(author, name, sha=version)
+    if skill is None:
+        raise HTTPException(404, "Skill not found")
+    return [
+        {"path": p, "size": len(d), "sha256": hashlib.sha256(d).hexdigest(), "text": _is_text(d)}
+        for p, d in sorted(_file_map(skill).items())
+    ]
+
+
+@router.get("/skills/{author}/{name}/files/{path:path}")
+def get_file(
+    ctx: RegistryDep, author: str, name: str, path: str, version: str | None = None
+) -> Response:
+    """One file of a skill. Text is served as ``text/plain`` and never as HTML; everything else is a
+    download. (Skill content is untrusted.)"""
+    skill = ctx.repo.get(author, name, sha=version)
+    if skill is None:
+        raise HTTPException(404, "Skill not found")
+    data = _file_map(skill).get(path)
+    if data is None:
+        raise HTTPException(404, "File not found")
+    if _is_text(data):
+        return Response(
+            data,
+            media_type="text/plain; charset=utf-8",
+            headers={"X-Content-Type-Options": "nosniff"},
+        )
+    return Response(
+        data,
+        media_type="application/octet-stream",
+        headers={
+            "Content-Disposition": f'attachment; filename="{Path(path).name}"',
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
+
+
+@router.get("/activity")
+def activity(
+    ctx: RegistryDep, limit: Annotated[int, Query(ge=1, le=200)] = 30
+) -> list[dict[str, Any]]:
+    """The newest skill versions of this registry (who published what, when)."""
+    from sqlalchemy import select
+
+    from owl_server import models as m
+
+    rows = ctx.session.execute(
+        select(m.Skill, m.SkillVersion)
+        .join(m.SkillVersion, m.SkillVersion.skill_id == m.Skill.id)
+        .where(m.Skill.registry_id == ctx.registry.id)
+        .order_by(m.SkillVersion.id.desc())
+        .limit(limit)
+    ).all()
+    return [
+        {
+            "ref": f"{s.author}/{s.name}",
+            "version": v.version,
+            "sha256": v.sha256,
+            "at": v.created_at,
+            "by": v.created_by,
+            "description": v.description,
+            "current": s.current_version_id == v.id,
+        }
+        for s, v in rows
+    ]
 
 
 # -- collections ---------------------------------------------------------------------------

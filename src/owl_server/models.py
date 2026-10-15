@@ -188,3 +188,12 @@ class OidcState(Base):
     verifier: Mapped[str] = mapped_column(String(128))
     created_at: Mapped[str] = mapped_column(String(40), default=now)
     expires_at: Mapped[str] = mapped_column(String(40))
+
+
+class ServerSetting(Base):
+    """Key/value settings changed at run time from the dashboard (for example ``secured``)."""
+
+    __tablename__ = "server_settings"
+
+    key: Mapped[str] = mapped_column(String(64), primary_key=True)
+    value: Mapped[str] = mapped_column(Text)

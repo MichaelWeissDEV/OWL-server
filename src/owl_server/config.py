@@ -2,6 +2,9 @@
 
 Every variable ``X`` can also be given as ``X_FILE`` pointing at a file whose content is the value,
 which keeps secrets out of the process environment and of ``docker inspect``.
+
+The server starts **open** (no authentication, everyone is an administrator) unless something to
+authenticate with is configured or the operator secures it - see :mod:`owl_server.access`.
 """
 
 from __future__ import annotations
@@ -37,6 +40,22 @@ def _bool(value: str | None, default: bool) -> bool:
     return value.strip().lower() in ("1", "true", "yes", "on")
 
 
+def _list(value: str | None, sep: str = ",") -> list[str]:
+    return [v.strip() for v in (value or "").split(sep) if v.strip()]
+
+
+@dataclass
+class Mapping:
+    """How an external identity becomes OWL rights (shared by every external provider)."""
+
+    #: values of the groups/roles that make a user a **server admin** (empty: admin flag untouched)
+    admin_values: list[str] = field(default_factory=list)
+    #: group value -> {registry slug: role}; applied on every login
+    registry_roles: dict[str, dict[str, str]] = field(default_factory=dict)
+    #: create an account on first login (False: only pre-created users may sign in)
+    auto_create: bool = True
+
+
 @dataclass
 class OidcSettings:
     issuer: str
@@ -47,11 +66,74 @@ class OidcSettings:
     audience: str | None = None  #: defaults to the client id
     username_claim: str = "preferred_username"
     role_claim: str | None = None
-    #: IdP group/role value -> "admin"; anyone else becomes an ordinary user
-    admin_values: list[str] = field(default_factory=list)
-    #: IdP group/role value -> {registry slug: role}
-    registry_roles: dict[str, dict[str, str]] = field(default_factory=dict)
     verify_tls: bool = True
+    label: str = "Single sign-on"
+    mapping: Mapping = field(default_factory=Mapping)
+
+    @property
+    def admin_values(self) -> list[str]:
+        return self.mapping.admin_values
+
+    @property
+    def registry_roles(self) -> dict[str, dict[str, str]]:
+        return self.mapping.registry_roles
+
+
+@dataclass
+class OAuthSettings:
+    """Plain OAuth 2.0 (providers without OpenID Connect, e.g. GitHub)."""
+
+    client_id: str
+    client_secret: str | None
+    redirect_uri: str
+    authorize_url: str
+    token_url: str
+    userinfo_url: str
+    scopes: str = ""
+    id_field: str = "id"
+    username_field: str = "login"
+    email_field: str = "email"
+    groups_field: str | None = None
+    allowed_users: list[str] = field(
+        default_factory=list
+    )  #: empty = anyone the provider authenticates
+    label: str = "OAuth login"
+    verify_tls: bool = True
+    mapping: Mapping = field(default_factory=Mapping)
+
+
+@dataclass
+class LdapSettings:
+    """LDAP / Active Directory: search the user with a service account, then bind as the user."""
+
+    url: str
+    bind_dn: str
+    bind_password: str
+    user_base: str
+    user_filter: str = "(sAMAccountName={username})"  #: OpenLDAP: (uid={username})
+    username_attr: str = "sAMAccountName"
+    email_attr: str = "mail"
+    group_attr: str = "memberOf"
+    start_tls: bool = False
+    verify_tls: bool = True
+    ca_file: str | None = None
+    timeout: int = 8
+    label: str = "Directory login"
+    mapping: Mapping = field(default_factory=Mapping)
+
+
+@dataclass
+class ProxySettings:
+    """Authentication done by a reverse proxy in front of OWL (Kerberos/SPNEGO, SAML, oauth2-proxy,
+    Authelia, ...). OWL trusts the headers **only** when they come with the shared secret."""
+
+    secret: str
+    user_header: str = "X-Remote-User"
+    email_header: str = "X-Remote-Email"
+    groups_header: str = "X-Remote-Groups"
+    groups_separator: str = ","
+    secret_header: str = "X-OWL-Proxy-Secret"
+    mapping: Mapping = field(default_factory=Mapping)
 
 
 @dataclass
@@ -60,7 +142,9 @@ class Settings:
     mode: str = "mixed"
     default_registry: str = "default"
     admin_token: str | None = None
-    local_accounts: bool = False
+    #: True/False force open/secured; None = automatic (see owl_server.access)
+    open: bool | None = None
+    local_accounts: bool = True
     auto_migrate: bool = True
     max_body_mb: int = 40
     session_ttl_hours: int = 12
@@ -68,10 +152,191 @@ class Settings:
     login_rate_per_minute: int = 10
     public_url: str | None = None
     oidc: OidcSettings | None = None
+    oauth: OAuthSettings | None = None
+    ldap: LdapSettings | None = None
+    proxy: ProxySettings | None = None
 
     @property
     def max_body_bytes(self) -> int:
         return self.max_body_mb * 1024 * 1024
+
+    @property
+    def external_providers(self) -> list[str]:
+        return [
+            n
+            for n, v in (
+                ("oidc", self.oidc),
+                ("oauth", self.oauth),
+                ("ldap", self.ldap),
+                ("proxy", self.proxy),
+            )
+            if v is not None
+        ]
+
+
+def _mapping(prefix: str, env: dict[str, str] | None) -> Mapping:
+    try:
+        roles = json.loads(_get(f"{prefix}_REGISTRY_ROLES", "{}", env) or "{}")
+    except ValueError as exc:
+        raise ConfigError(f"{PREFIX}{prefix}_REGISTRY_ROLES is not valid JSON: {exc}") from exc
+    if not isinstance(roles, dict):
+        raise ConfigError(f"{PREFIX}{prefix}_REGISTRY_ROLES must be a JSON object")
+    for group, regs in roles.items():
+        if not isinstance(regs, dict) or any(
+            r not in ("reader", "publisher", "admin") for r in regs.values()
+        ):
+            raise ConfigError(
+                f"{PREFIX}{prefix}_REGISTRY_ROLES['{group}'] must map registry slugs to reader/publisher/admin"
+            )
+    return Mapping(
+        admin_values=_list(_get(f"{prefix}_ADMIN_VALUES", env=env)),
+        registry_roles=roles,
+        auto_create=_bool(_get(f"{prefix}_AUTO_CREATE", env=env), True),
+    )
+
+
+GITHUB = {
+    "authorize_url": "https://github.com/login/oauth/authorize",
+    "token_url": "https://github.com/login/oauth/access_token",
+    "userinfo_url": "https://api.github.com/user",
+    "scopes": "read:user user:email",
+    "username_field": "login",
+    "label": "Sign in with GitHub",
+}
+
+
+def _oidc(env: dict[str, str] | None) -> OidcSettings | None:
+    issuer = _get("OIDC_ISSUER", env=env)
+    if not issuer:
+        return None
+    client_id, redirect = _get("OIDC_CLIENT_ID", env=env), _get("OIDC_REDIRECT_URI", env=env)
+    if not client_id or not redirect:
+        raise ConfigError("OIDC needs OWL_SERVER_OIDC_CLIENT_ID and OWL_SERVER_OIDC_REDIRECT_URI")
+    if not issuer.startswith("https://") and not _bool(_get("OIDC_ALLOW_INSECURE", env=env), False):
+        raise ConfigError("OWL_SERVER_OIDC_ISSUER must be an https:// URL")
+    return OidcSettings(
+        issuer=issuer.rstrip("/"),
+        client_id=client_id,
+        client_secret=_get("OIDC_CLIENT_SECRET", env=env),
+        redirect_uri=redirect,
+        scopes=_get("OIDC_SCOPES", "openid profile email", env) or "openid",
+        audience=_get("OIDC_AUDIENCE", env=env),
+        username_claim=_get("OIDC_USERNAME_CLAIM", "preferred_username", env)
+        or "preferred_username",
+        role_claim=_get("OIDC_ROLE_CLAIM", env=env),
+        verify_tls=_bool(_get("OIDC_VERIFY_TLS", env=env), True),
+        label=_get("OIDC_LABEL", "Single sign-on", env) or "Single sign-on",
+        mapping=_mapping("OIDC", env),
+    )
+
+
+def _oauth(env: dict[str, str] | None) -> OAuthSettings | None:
+    client_id = _get("OAUTH_CLIENT_ID", env=env)
+    if not client_id:
+        return None
+    preset = (_get("OAUTH_PRESET", env=env) or "").lower()
+    if preset not in ("", "github"):
+        raise ConfigError("OWL_SERVER_OAUTH_PRESET must be empty or 'github'")
+    base = dict(GITHUB) if preset == "github" else {}
+
+    def pick(name: str, key: str, default: str | None = None) -> str:
+        value = _get(f"OAUTH_{name}", env=env) or base.get(key) or default
+        if not value:
+            raise ConfigError(
+                f"OAuth needs OWL_SERVER_OAUTH_{name} (or OWL_SERVER_OAUTH_PRESET=github)"
+            )
+        return value
+
+    redirect = _get("OAUTH_REDIRECT_URI", env=env)
+    if not redirect:
+        raise ConfigError("OAuth needs OWL_SERVER_OAUTH_REDIRECT_URI")
+    urls = [
+        pick("AUTHORIZE_URL", "authorize_url"),
+        pick("TOKEN_URL", "token_url"),
+        pick("USERINFO_URL", "userinfo_url"),
+    ]
+    if any(not u.startswith("https://") for u in urls) and not _bool(
+        _get("OAUTH_ALLOW_INSECURE", env=env), False
+    ):
+        raise ConfigError("OAuth endpoints must be https:// URLs")
+    return OAuthSettings(
+        client_id=client_id,
+        client_secret=_get("OAUTH_CLIENT_SECRET", env=env),
+        redirect_uri=redirect,
+        authorize_url=urls[0],
+        token_url=urls[1],
+        userinfo_url=urls[2],
+        scopes=_get("OAUTH_SCOPES", base.get("scopes", ""), env) or "",
+        id_field=_get("OAUTH_ID_FIELD", "id", env) or "id",
+        username_field=_get("OAUTH_USERNAME_FIELD", base.get("username_field", "login"), env)
+        or "login",
+        email_field=_get("OAUTH_EMAIL_FIELD", "email", env) or "email",
+        groups_field=_get("OAUTH_GROUPS_FIELD", env=env),
+        allowed_users=_list(_get("OAUTH_ALLOWED_USERS", env=env)),
+        label=_get("OAUTH_LABEL", base.get("label", "OAuth login"), env) or "OAuth login",
+        verify_tls=_bool(_get("OAUTH_VERIFY_TLS", env=env), True),
+        mapping=_mapping("OAUTH", env),
+    )
+
+
+def _ldap(env: dict[str, str] | None) -> LdapSettings | None:
+    url = _get("LDAP_URL", env=env)
+    if not url:
+        return None
+    if not url.lower().startswith(("ldaps://", "ldap://")):
+        raise ConfigError("OWL_SERVER_LDAP_URL must start with ldaps:// or ldap://")
+    insecure_ok = _bool(_get("LDAP_ALLOW_INSECURE", env=env), False)
+    start_tls = _bool(_get("LDAP_START_TLS", env=env), False)
+    if url.lower().startswith("ldap://") and not start_tls and not insecure_ok:
+        raise ConfigError(
+            "Plain ldap:// would send passwords unencrypted: use ldaps://, "
+            "OWL_SERVER_LDAP_START_TLS=true, or OWL_SERVER_LDAP_ALLOW_INSECURE=true for a lab"
+        )
+    missing = [
+        n for n in ("BIND_DN", "BIND_PASSWORD", "USER_BASE") if not _get(f"LDAP_{n}", env=env)
+    ]
+    if missing:
+        raise ConfigError("LDAP needs " + ", ".join(f"OWL_SERVER_LDAP_{n}" for n in missing))
+    user_filter = _get("LDAP_USER_FILTER", "(sAMAccountName={username})", env) or ""
+    if "{username}" not in user_filter:
+        raise ConfigError("OWL_SERVER_LDAP_USER_FILTER must contain {username}")
+    return LdapSettings(
+        url=url,
+        bind_dn=_get("LDAP_BIND_DN", env=env) or "",
+        bind_password=_get("LDAP_BIND_PASSWORD", env=env) or "",
+        user_base=_get("LDAP_USER_BASE", env=env) or "",
+        user_filter=user_filter,
+        username_attr=_get("LDAP_USERNAME_ATTR", "sAMAccountName", env) or "sAMAccountName",
+        email_attr=_get("LDAP_EMAIL_ATTR", "mail", env) or "mail",
+        group_attr=_get("LDAP_GROUP_ATTR", "memberOf", env) or "memberOf",
+        start_tls=start_tls,
+        verify_tls=_bool(_get("LDAP_VERIFY_TLS", env=env), True),
+        ca_file=_get("LDAP_CA_FILE", env=env),
+        timeout=int(_get("LDAP_TIMEOUT", "8", env) or 8),
+        label=_get("LDAP_LABEL", "Directory login", env) or "Directory login",
+        mapping=_mapping("LDAP", env),
+    )
+
+
+def _proxy(env: dict[str, str] | None) -> ProxySettings | None:
+    if not _bool(_get("PROXY_AUTH", env=env), False):
+        return None
+    secret = _get("PROXY_SECRET", env=env)
+    if not secret or len(secret) < 24:
+        raise ConfigError(
+            "Proxy authentication needs OWL_SERVER_PROXY_SECRET (>= 24 characters): the proxy "
+            "must send it so that OWL can tell real proxy headers from forged ones"
+        )
+    return ProxySettings(
+        secret=secret,
+        user_header=_get("PROXY_USER_HEADER", "X-Remote-User", env) or "X-Remote-User",
+        email_header=_get("PROXY_EMAIL_HEADER", "X-Remote-Email", env) or "X-Remote-Email",
+        groups_header=_get("PROXY_GROUPS_HEADER", "X-Remote-Groups", env) or "X-Remote-Groups",
+        groups_separator=_get("PROXY_GROUPS_SEPARATOR", ",", env) or ",",
+        secret_header=_get("PROXY_SECRET_HEADER", "X-OWL-Proxy-Secret", env)
+        or "X-OWL-Proxy-Secret",
+        mapping=_mapping("PROXY", env),
+    )
 
 
 def load_settings(env: dict[str, str] | None = None) -> Settings:
@@ -90,50 +355,22 @@ def load_settings(env: dict[str, str] | None = None) -> Settings:
     max_body = int(_get("MAX_BODY_MB", "40", env) or 40)
     if max_body < 1:
         raise ConfigError("OWL_SERVER_MAX_BODY_MB must be at least 1")
-    oidc = None
-    issuer = _get("OIDC_ISSUER", env=env)
-    if issuer:
-        client_id = _get("OIDC_CLIENT_ID", env=env)
-        redirect = _get("OIDC_REDIRECT_URI", env=env)
-        if not client_id or not redirect:
-            raise ConfigError(
-                "OIDC needs OWL_SERVER_OIDC_CLIENT_ID and OWL_SERVER_OIDC_REDIRECT_URI"
-            )
-        if not issuer.startswith("https://") and not _bool(
-            _get("OIDC_ALLOW_INSECURE", env=env), False
-        ):
-            raise ConfigError("OWL_SERVER_OIDC_ISSUER must be an https:// URL")
-        try:
-            registry_roles = json.loads(_get("OIDC_REGISTRY_ROLES", "{}", env) or "{}")
-        except ValueError as exc:
-            raise ConfigError(f"OWL_SERVER_OIDC_REGISTRY_ROLES is not valid JSON: {exc}") from exc
-        oidc = OidcSettings(
-            issuer=issuer.rstrip("/"),
-            client_id=client_id,
-            client_secret=_get("OIDC_CLIENT_SECRET", env=env),
-            redirect_uri=redirect,
-            scopes=_get("OIDC_SCOPES", "openid profile email", env) or "openid",
-            audience=_get("OIDC_AUDIENCE", env=env),
-            username_claim=_get("OIDC_USERNAME_CLAIM", "preferred_username", env)
-            or "preferred_username",
-            role_claim=_get("OIDC_ROLE_CLAIM", env=env),
-            admin_values=[
-                v for v in (_get("OIDC_ADMIN_VALUES", "", env) or "").split(",") if v.strip()
-            ],
-            registry_roles=registry_roles,
-            verify_tls=_bool(_get("OIDC_VERIFY_TLS", env=env), True),
-        )
+    open_raw = _get("OPEN", env=env)
     return Settings(
         database_url=database_url,
         mode=mode,
         default_registry=_get("DEFAULT_REGISTRY", "default", env) or "default",
         admin_token=admin_token,
-        local_accounts=_bool(_get("LOCAL_ACCOUNTS", env=env), False),
+        open=None if open_raw is None else _bool(open_raw, True),
+        local_accounts=_bool(_get("LOCAL_ACCOUNTS", env=env), True),
         auto_migrate=_bool(_get("AUTO_MIGRATE", env=env), True),
         max_body_mb=max_body,
         session_ttl_hours=int(_get("SESSION_TTL_HOURS", "12", env) or 12),
-        cors_origins=[o for o in (_get("CORS_ORIGINS", "", env) or "").split(",") if o.strip()],
+        cors_origins=_list(_get("CORS_ORIGINS", env=env)),
         login_rate_per_minute=int(_get("LOGIN_RATE_PER_MINUTE", "10", env) or 10),
         public_url=_get("PUBLIC_URL", env=env),
-        oidc=oidc,
+        oidc=_oidc(env),
+        oauth=_oauth(env),
+        ldap=_ldap(env),
+        proxy=_proxy(env),
     )

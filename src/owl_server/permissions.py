@@ -40,11 +40,13 @@ class Principal:
 
 
 ANONYMOUS = Principal()
+#: everyone while the server is open (see owl_server.access)
+OPEN = Principal(kind="open", username="open-mode", is_admin=True)
 
 
 def is_server_admin(principal: Principal) -> bool:
     """May manage registries, users and tokens (a capped or registry-scoped token may not)."""
-    if principal.kind == "bootstrap":
+    if principal.kind in ("bootstrap", "open"):
         return True
     return (
         principal.kind == "user"
@@ -57,7 +59,7 @@ def is_server_admin(principal: Principal) -> bool:
 def effective_role(principal: Principal, registry_id: int, visibility: str) -> str | None:
     """The role *principal* has in the registry (``None`` = no access at all)."""
     role: str | None = None
-    if principal.kind == "bootstrap":
+    if principal.kind in ("bootstrap", "open"):
         role = "admin"
     elif principal.kind == "user":
         role = "admin" if principal.is_admin else dict(principal.memberships).get(registry_id)

@@ -14,10 +14,12 @@ from owl.models import OwlError
 from sqlalchemy import select
 from sqlalchemy.engine import Engine
 
-from owl_server import __version__, db
+from owl_server import __version__, access, db
 from owl_server import models as m
 from owl_server.config import Settings
 from owl_server.deps import AppState
+from owl_server.ldap_auth import LdapService
+from owl_server.oauth import OAuthService
 from owl_server.oidc import OidcService
 from owl_server.ratelimit import RateLimiter
 from owl_server.routes import admin, auth, skills, system
@@ -76,12 +78,14 @@ class SecurityHeadersMiddleware:
         async def wrapped(message: dict) -> None:
             if message["type"] == "http.response.start":
                 headers = list(message.get("headers", []))
+                present = {k.lower() for k, _ in headers}
                 for key, value in (
                     (b"x-content-type-options", b"nosniff"),
                     (b"referrer-policy", b"no-referrer"),
                     (b"x-frame-options", b"DENY"),
                 ):
-                    headers.append((key, value))
+                    if key not in present:
+                        headers.append((key, value))
                 message["headers"] = headers
             await send(message)
 
@@ -110,6 +114,8 @@ def create_app(
     settings: Settings,
     engine: Engine | None = None,
     oidc_client: httpx.Client | None = None,
+    oauth_client: httpx.Client | None = None,
+    ldap_connection_factory: Any = None,
 ) -> FastAPI:
     """Build the API. Migrations are applied first when ``auto_migrate`` is set."""
     if engine is None:
@@ -122,13 +128,24 @@ def create_app(
         version=__version__,
         description="Self-hostable skill registry compatible with the OWL CLI.",
     )
+    factory = db.make_session_factory(engine)
     app.state.owl = AppState(
         settings=settings,
-        factory=db.make_session_factory(engine),
+        factory=factory,
         limiter=RateLimiter(settings.login_rate_per_minute),
         oidc=OidcService(settings.oidc, oidc_client) if settings.oidc else None,
+        oauth=OAuthService(settings.oauth, oauth_client) if settings.oauth else None,
+        ldap=LdapService(settings.ldap, ldap_connection_factory) if settings.ldap else None,
     )
     app.state.engine = engine
+    with db.session_scope(factory) as session:
+        is_open, reason = access.open_state(settings, session)
+    if is_open:
+        log.warning(
+            "OPEN MODE: no authentication - everyone who can reach this server is an administrator (%s). "
+            "Secure it in the dashboard (Settings) or set OWL_SERVER_OPEN=false.",
+            reason,
+        )
 
     @app.exception_handler(OwlError)
     async def owl_error(_request: Request, exc: OwlError) -> JSONResponse:

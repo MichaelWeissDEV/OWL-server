@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Body, HTTPException, Query, Request, Response
@@ -9,12 +10,14 @@ from fastapi.responses import RedirectResponse
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from owl_server import accounts, audit
+from owl_server import access, accounts, audit, external
 from owl_server import models as m
 from owl_server.deps import PrincipalDep, SessionDep, app_state, client_ip
+from owl_server.ldap_auth import LdapError
 from owl_server.oidc import OidcError
 from owl_server.permissions import ROLES, is_server_admin
 
+log = logging.getLogger("owl_server")
 router = APIRouter(prefix="/auth")
 
 
@@ -42,13 +45,26 @@ def _limit(request: Request, key: str) -> None:
 
 
 @router.get("/config")
-def auth_config(request: Request) -> dict[str, Any]:
-    """What login methods this server offers (used by the dashboard's login page)."""
-    settings = app_state(request).settings
+def auth_config(request: Request, session: SessionDep) -> dict[str, Any]:
+    """What the login page needs: whether the server is open and which sign-in methods exist."""
+    state = app_state(request)
+    settings = state.settings
+    is_open, reason = access.open_state(settings, session)
+    providers = []
+    if settings.oidc:
+        providers.append({"id": "oidc", "type": "oidc", "label": settings.oidc.label})
+    if settings.oauth:
+        providers.append({"id": "oauth", "type": "oauth2", "label": settings.oauth.label})
     return {
-        "local_accounts": settings.local_accounts,
-        "oidc": settings.oidc is not None,
+        "open": is_open,
+        "open_reason": reason,
         "mode": settings.mode,
+        "local_accounts": settings.local_accounts,
+        "ldap": {"label": settings.ldap.label} if settings.ldap else None,
+        "proxy": settings.proxy is not None,
+        "providers": providers,
+        # kept for older clients
+        "oidc": settings.oidc is not None,
     }
 
 
@@ -59,24 +75,59 @@ def login(
     session: SessionDep,
     body: Annotated[dict[str, Any], Body()],
 ) -> dict[str, Any]:
-    settings = app_state(request).settings
-    if not settings.local_accounts:
-        raise HTTPException(404, "Local accounts are not enabled on this server")
-    username, password = str(body.get("username", "")), str(body.get("password", ""))
+    """Password login: a local account first, then the directory (LDAP / Active Directory)."""
+    state = app_state(request)
+    settings = state.settings
+    if not settings.local_accounts and state.ldap is None:
+        raise HTTPException(404, "Password login is not enabled on this server")
+    username, password = str(body.get("username", "")).strip(), str(body.get("password", ""))
     _limit(request, "login")
     _limit(request, f"login:{username.lower()}")
-    user = accounts.authenticate_password(session, username, password)
+    user = None
+    local = accounts.get_user(session, username)
+    if settings.local_accounts and (local is None or local.provider == "local"):
+        user = accounts.authenticate_password(session, username, password)
+    if user is None and state.ldap is not None and (local is None or local.provider == "ldap"):
+        user = _ldap_login(state, session, username, password)
     if user is None:
         audit.record(
             session, "anonymous", "auth.login_failed", username[:100], ip=client_ip(request)
         )
         session.commit()
         raise HTTPException(401, "Wrong username or password")
-    audit.record(session, f"user:{user.username}", "auth.login", ip=client_ip(request))
+    audit.record(
+        session,
+        f"user:{user.username}",
+        "auth.login",
+        f"via {user.provider}",
+        ip=client_ip(request),
+    )
     result = _session_response(session, request, user)
     session.commit()
     _no_store(response)
     return result
+
+
+def _ldap_login(state, session: Session, username: str, password: str) -> m.User | None:  # type: ignore[no-untyped-def]
+    try:
+        identity = state.ldap.authenticate(username, password)
+    except LdapError as exc:
+        log.warning("LDAP problem: %s", exc)
+        raise HTTPException(502, "The directory is not reachable") from exc
+    if identity is None:
+        return None
+    try:
+        return external.provision(
+            session,
+            state.settings.ldap.mapping,
+            provider="ldap",
+            subject=identity.dn.lower(),
+            username=identity.username,
+            email=identity.email,
+            groups=identity.groups,
+        )
+    except external.ExternalLoginError as exc:
+        raise HTTPException(exc.status, exc.public) from exc
 
 
 @router.post("/logout")
@@ -232,77 +283,127 @@ def revoke_token(
     return {"revoked": True}
 
 
-# -- OpenID Connect ------------------------------------------------------------------------------
+# -- single sign-on: OpenID Connect and OAuth 2.0 ---------------------------------------------------
 
 
-def _oidc(request: Request):  # type: ignore[no-untyped-def]
-    service = app_state(request).oidc
+def _sso_service(request: Request, provider: str):  # type: ignore[no-untyped-def]
+    state = app_state(request)
+    service = {"oidc": state.oidc, "oauth": state.oauth}.get(provider)
     if service is None:
-        raise HTTPException(404, "OpenID Connect is not configured on this server")
+        raise HTTPException(404, "This sign-in method is not configured on this server")
     return service
 
 
+def _sso_begin(request: Request, session: Session, provider: str, as_json: bool):  # type: ignore[no-untyped-def]
+    _limit(request, "sso")
+    service = _sso_service(request, provider)
+    try:
+        url = service.begin(session)
+    except OidcError as exc:
+        raise HTTPException(exc.status, exc.public) from exc
+    session.commit()
+    return {"authorization_url": url} if as_json else RedirectResponse(url, status_code=302)
+
+
+def _sso_complete(
+    request: Request, session: Session, provider: str, code: str, state: str
+) -> dict[str, Any]:
+    service = _sso_service(request, provider)
+    settings = app_state(request).settings
+    try:
+        if provider == "oidc":
+            claims = service.complete(session, code, state)
+            cfg = settings.oidc
+            assert cfg is not None
+            subject = str(claims["sub"])
+            username = str(claims.get(cfg.username_claim) or claims.get("email") or claims["sub"])
+            email, groups, mapping = claims.get("email"), service.claim_values(claims), cfg.mapping
+        else:
+            profile = service.complete(session, code, state)
+            oauth_cfg = settings.oauth
+            assert oauth_cfg is not None
+            subject = str(profile[oauth_cfg.id_field])
+            username = str(profile.get(oauth_cfg.username_field) or subject)
+            email = profile.get(oauth_cfg.email_field)
+            raw = profile.get(oauth_cfg.groups_field) if oauth_cfg.groups_field else []
+            groups = [str(g) for g in raw] if isinstance(raw, list) else ([str(raw)] if raw else [])
+            mapping = oauth_cfg.mapping
+            if oauth_cfg.allowed_users and username.lower() not in {
+                u.lower() for u in oauth_cfg.allowed_users
+            }:
+                audit.record(
+                    session, "anonymous", "auth.oauth_denied", username[:100], ip=client_ip(request)
+                )
+                session.commit()
+                raise HTTPException(403, "This account is not allowed to sign in")
+    except OidcError as exc:
+        audit.record(
+            session,
+            "anonymous",
+            f"auth.{provider}_failed",
+            detail=str(exc)[:300],
+            ip=client_ip(request),
+        )
+        session.commit()
+        raise HTTPException(exc.status, exc.public) from exc
+    try:
+        user = external.provision(
+            session,
+            mapping,
+            provider=provider,
+            subject=subject,
+            username=username,
+            email=email,
+            groups=groups,
+        )
+    except external.ExternalLoginError as exc:
+        raise HTTPException(exc.status, exc.public) from exc
+    audit.record(session, f"user:{user.username}", f"auth.{provider}_login", ip=client_ip(request))
+    result = _session_response(session, request, user)
+    session.commit()
+    return result
+
+
+@router.get("/sso/{provider}/login")
+def sso_login(
+    request: Request,
+    session: SessionDep,
+    provider: str,
+    as_json: Annotated[bool, Query(alias="json")] = False,
+):  # type: ignore[no-untyped-def]
+    """Start a single sign-on: redirect to the provider (or return the URL with ``?json=1``)."""
+    return _sso_begin(request, session, provider, as_json)
+
+
+@router.get("/sso/{provider}/callback")
+def sso_callback(
+    request: Request, response: Response, session: SessionDep, provider: str, code: str, state: str
+) -> dict[str, Any]:
+    _no_store(response)
+    return _sso_complete(request, session, provider, code, state)
+
+
+@router.post("/sso/{provider}/exchange")
+def sso_exchange(
+    request: Request,
+    response: Response,
+    session: SessionDep,
+    provider: str,
+    body: Annotated[dict[str, Any], Body()],
+) -> dict[str, Any]:
+    """For single-page apps: the redirect lands in the dashboard, which posts ``code`` and ``state``."""
+    _no_store(response)
+    return _sso_complete(
+        request, session, provider, str(body.get("code", "")), str(body.get("state", ""))
+    )
+
+
+# the original OIDC paths keep working
 @router.get("/oidc/login")
 def oidc_login(
     request: Request, session: SessionDep, as_json: Annotated[bool, Query(alias="json")] = False
 ):  # type: ignore[no-untyped-def]
-    """Start the login: redirect to the identity provider (or return the URL with ``?json=1``)."""
-    _limit(request, "oidc")
-    service = _oidc(request)
-    try:
-        url = service.begin(session)
-    except OidcError as exc:
-        raise HTTPException(502, exc.public) from exc
-    session.commit()
-    if as_json:
-        return {"authorization_url": url}
-    return RedirectResponse(url, status_code=302)
-
-
-def _complete(request: Request, session: Session, code: str, state: str) -> dict[str, Any]:
-    service = _oidc(request)
-    settings = app_state(request).settings
-    assert settings.oidc is not None
-    try:
-        claims = service.complete(session, code, state)
-    except OidcError as exc:
-        audit.record(
-            session, "anonymous", "auth.oidc_failed", detail=str(exc)[:300], ip=client_ip(request)
-        )
-        session.commit()
-        raise HTTPException(401 if "provider" not in exc.public else 502, exc.public) from exc
-    username = str(claims.get(settings.oidc.username_claim) or claims.get("email") or claims["sub"])
-    user = session.scalar(
-        select(m.User).where(m.User.provider == "oidc", m.User.subject == str(claims["sub"]))
-    )
-    if user is None:
-        if accounts.get_user(session, username) is not None:
-            username = f"{username}@oidc"
-        try:
-            user = accounts.create_user(
-                session,
-                username,
-                None,
-                email=claims.get("email"),
-                provider="oidc",
-                subject=str(claims["sub"]),
-            )
-        except accounts.AccountError as exc:
-            raise HTTPException(409, str(exc)) from exc
-    if not user.active:
-        raise HTTPException(403, "This account is disabled")
-    values = service.claim_values(claims)
-    user.is_admin = any(v in settings.oidc.admin_values for v in values)
-    for value in values:
-        for slug, role in settings.oidc.registry_roles.get(value, {}).items():
-            registry = session.scalar(select(m.Registry).where(m.Registry.slug == slug))
-            if registry is not None:
-                accounts.set_membership(session, registry, user, role)
-    user.last_login = m.now()
-    audit.record(session, f"user:{user.username}", "auth.oidc_login", ip=client_ip(request))
-    result = _session_response(session, request, user)
-    session.commit()
-    return result
+    return _sso_begin(request, session, "oidc", as_json)
 
 
 @router.get("/oidc/callback")
@@ -310,7 +411,7 @@ def oidc_callback(
     request: Request, response: Response, session: SessionDep, code: str, state: str
 ) -> dict[str, Any]:
     _no_store(response)
-    return _complete(request, session, code, state)
+    return _sso_complete(request, session, "oidc", code, state)
 
 
 @router.post("/oidc/exchange")
@@ -320,6 +421,7 @@ def oidc_exchange(
     session: SessionDep,
     body: Annotated[dict[str, Any], Body()],
 ) -> dict[str, Any]:
-    """For single-page apps: the redirect lands in the dashboard, which posts ``code`` and ``state`` here."""
     _no_store(response)
-    return _complete(request, session, str(body.get("code", "")), str(body.get("state", "")))
+    return _sso_complete(
+        request, session, "oidc", str(body.get("code", "")), str(body.get("state", ""))
+    )

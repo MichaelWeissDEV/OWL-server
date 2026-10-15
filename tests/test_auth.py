@@ -29,7 +29,8 @@ def login(client, username, password=GOOD):
     return client.post("/api/v1/auth/login", json={"username": username, "password": password})
 
 
-def test_local_accounts_are_off_by_default(client):
+def test_local_accounts_can_be_switched_off(make_app):
+    client = make_app(local_accounts="false")
     assert (
         client.post("/api/v1/auth/login", json={"username": "a", "password": "b"}).status_code
         == 404
@@ -40,11 +41,10 @@ def test_local_accounts_are_off_by_default(client):
         ).status_code
         == 404
     )
-    assert client.get("/api/v1/auth/config").json() == {
-        "local_accounts": False,
-        "oidc": False,
-        "mode": "mixed",
-    }
+    config = client.get("/api/v1/auth/config").json()
+    assert (
+        config["local_accounts"] is False and config["open"] is False and config["providers"] == []
+    )
 
 
 def test_login_session_me_and_logout(accounts_client):

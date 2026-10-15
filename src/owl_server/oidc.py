@@ -30,9 +30,12 @@ STATE_TTL = timedelta(minutes=10)
 class OidcError(Exception):
     """Login failed; ``public`` is safe to show to the user, details go to the log."""
 
-    def __init__(self, public: str, detail: str = "") -> None:
+    def __init__(self, public: str, detail: str = "", status: int = 401) -> None:
         super().__init__(detail or public)
         self.public = public
+        self.status = (
+            status  #: 502 when the provider is unreachable or misconfigured, 401 otherwise
+        )
 
 
 def _pkce_challenge(verifier: str) -> str:
@@ -60,15 +63,19 @@ class OidcService:
             doc = response.json()
         except (httpx.HTTPError, ValueError) as exc:
             raise OidcError(
-                "The identity provider is not reachable", f"discovery failed: {exc}"
+                "The identity provider is not reachable", f"discovery failed: {exc}", status=502
             ) from exc
         if str(doc.get("issuer", "")).rstrip("/") != self.settings.issuer:
             raise OidcError(
-                "The identity provider is misconfigured", "issuer in discovery document differs"
+                "The identity provider is misconfigured",
+                "issuer in discovery document differs",
+                status=502,
             )
         for key in ("authorization_endpoint", "token_endpoint", "jwks_uri"):
             if key not in doc:
-                raise OidcError("The identity provider is misconfigured", f"discovery lacks {key}")
+                raise OidcError(
+                    "The identity provider is misconfigured", f"discovery lacks {key}", status=502
+                )
         self._discovery = (time.monotonic(), doc)
         return doc
 
@@ -81,7 +88,7 @@ class OidcService:
             data = response.json()
         except (httpx.HTTPError, ValueError) as exc:
             raise OidcError(
-                "The identity provider is not reachable", f"jwks fetch failed: {exc}"
+                "The identity provider is not reachable", f"jwks fetch failed: {exc}", status=502
             ) from exc
         self._jwks = (time.monotonic(), data)
         return data
@@ -144,7 +151,7 @@ class OidcService:
             )
         except httpx.HTTPError as exc:
             raise OidcError(
-                "The identity provider is not reachable", f"token request failed: {exc}"
+                "The identity provider is not reachable", f"token request failed: {exc}", status=502
             ) from exc
         if response.status_code >= 400:
             raise OidcError(

@@ -28,14 +28,15 @@ def cmd_serve(args: argparse.Namespace) -> int:
 
     settings = _settings()
     app = create_app(settings)
-    if (
-        settings.mode != "private"
-        and not settings.admin_token
-        and not settings.local_accounts
-        and not settings.oidc
-    ):
+    from owl_server import access
+
+    with db.session_scope(app.state.owl.factory) as session:
+        is_open, _reason = access.open_state(settings, session)
+    if is_open and args.host not in ("127.0.0.1", "localhost", "::1"):
         print(
-            "warning: no admin token, local accounts or OIDC configured - the server is read-only",
+            "WARNING: the server is OPEN (no authentication) and listens on a non-local address. "
+            "Anyone who can reach it is an administrator. Secure it first, or put it behind an "
+            "authenticating proxy.",
             file=sys.stderr,
         )
     uvicorn.run(
@@ -119,7 +120,11 @@ def main(argv: list[str] | None = None) -> int:
     serve.add_argument(
         "--proxy-headers", action="store_true", help="trust X-Forwarded-* from a reverse proxy"
     )
-    serve.add_argument("--forwarded-allow-ips", default="127.0.0.1")
+    serve.add_argument(
+        "--forwarded-allow-ips",
+        default=None,
+        help="proxies whose X-Forwarded-* headers are trusted (default: $FORWARDED_ALLOW_IPS or 127.0.0.1)",
+    )
     serve.set_defaults(func=cmd_serve)
     sub.add_parser("migrate", help="apply database migrations").set_defaults(func=cmd_migrate)
     sub.add_parser("check-config", help="validate the environment").set_defaults(

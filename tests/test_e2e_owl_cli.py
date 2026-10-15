@@ -146,3 +146,40 @@ def test_cli_against_default_registry_path_without_prefix(live_server, tmp_path)
     assert [s["name"] for s in json.loads(owl("list", "-r", "classic", "--json").stdout)] == [
         "plain"
     ]
+
+
+def test_open_server_needs_no_token_at_all(database_url, monkeypatch, tmp_path):
+    """The out-of-the-box experience: the CLI pushes and searches without any credentials."""
+    sock = socket.socket()
+    sock.bind(("127.0.0.1", 0))
+    port = sock.getsockname()[1]
+    sock.close()
+    server = uvicorn.Server(
+        uvicorn.Config(
+            create_app(load_settings({"OWL_SERVER_DATABASE_URL": database_url})),
+            host="127.0.0.1",
+            port=port,
+            log_level="warning",
+        )
+    )
+    thread = threading.Thread(target=server.run, daemon=True)
+    thread.start()
+    for _ in range(100):
+        if server.started:
+            break
+        time.sleep(0.05)
+    try:
+        monkeypatch.setenv("OWL_HOME", str(tmp_path / "home"))
+        monkeypatch.setenv("OWL_DEFAULT_REGISTRY", "")
+        owl("init", "--mode", "client", "--author", "me")
+        owl("remote", "add", "lab", f"http://127.0.0.1:{port}")
+        src = tmp_path / "s"
+        write_skill_dir(make_skill("open-skill", "me"), src / "o")
+        owl("add", str(src))
+        assert "pushed" in owl("push", "--all", "-r", "lab").stdout
+        assert [s["name"] for s in json.loads(owl("list", "-r", "lab", "--json").stdout)] == [
+            "open-skill"
+        ]
+    finally:
+        server.should_exit = True
+        thread.join(timeout=5)

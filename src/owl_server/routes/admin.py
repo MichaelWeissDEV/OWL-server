@@ -5,16 +5,16 @@ from __future__ import annotations
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Body, HTTPException, Query, Request
-from sqlalchemy import select
+from sqlalchemy import func, select
 
-from owl_server import accounts, audit
+from owl_server import __version__, access, accounts, audit, db
 from owl_server import models as m
 from owl_server.deps import AdminDep, SessionDep, app_state, client_ip
 
 router = APIRouter(prefix="/admin")
 
 
-def _user_dict(user: m.User) -> dict[str, Any]:
+def _user_dict(user: m.User, memberships: list[dict[str, str]] | None = None) -> dict[str, Any]:
     return {
         "username": user.username,
         "email": user.email,
@@ -23,12 +23,37 @@ def _user_dict(user: m.User) -> dict[str, Any]:
         "provider": user.provider,
         "created_at": user.created_at,
         "last_login": user.last_login,
+        "memberships": memberships or [],
     }
+
+
+def _memberships(session) -> dict[int, list[dict[str, str]]]:  # type: ignore[no-untyped-def]
+    out: dict[int, list[dict[str, str]]] = {}
+    rows = session.execute(
+        select(m.Membership.user_id, m.Registry.slug, m.Membership.role)
+        .join(m.Registry, m.Registry.id == m.Membership.registry_id)
+        .order_by(m.Registry.slug)
+    ).all()
+    for user_id, slug, role in rows:
+        out.setdefault(user_id, []).append({"registry": slug, "role": role})
+    return out
 
 
 @router.get("/users")
 def list_users(session: SessionDep, admin: AdminDep) -> list[dict[str, Any]]:
-    return [_user_dict(u) for u in session.scalars(select(m.User).order_by(m.User.username))]
+    members = _memberships(session)
+    return [
+        _user_dict(u, members.get(u.id))
+        for u in session.scalars(select(m.User).order_by(m.User.username))
+    ]
+
+
+@router.get("/users/{username}")
+def get_user(session: SessionDep, admin: AdminDep, username: str) -> dict[str, Any]:
+    user = accounts.get_user(session, username)
+    if user is None:
+        raise HTTPException(404, "User not found")
+    return _user_dict(user, _memberships(session).get(user.id))
 
 
 @router.post("/users", status_code=201)
@@ -189,3 +214,103 @@ def audit_log(
         }
         for e in session.scalars(stmt)
     ]
+
+
+@router.delete("/users/{username}")
+def delete_user(
+    request: Request, session: SessionDep, admin: AdminDep, username: str
+) -> dict[str, bool]:
+    """Remove an account with its memberships and tokens. Skills it created stay (history keeps the name)."""
+    user = accounts.get_user(session, username)
+    if user is None:
+        raise HTTPException(404, "User not found")
+    if admin.kind == "user" and admin.user_id == user.id:
+        raise HTTPException(409, "You cannot delete your own account")
+    for membership in session.scalars(select(m.Membership).where(m.Membership.user_id == user.id)):
+        session.delete(membership)
+    for token in session.scalars(select(m.ApiToken).where(m.ApiToken.user_id == user.id)):
+        session.delete(token)
+    session.flush()
+    session.delete(user)
+    audit.record(session, admin, "user.delete", username, ip=client_ip(request))
+    session.commit()
+    return {"deleted": True}
+
+
+@router.get("/server")
+def server_info(request: Request, session: SessionDep, admin: AdminDep) -> dict[str, Any]:
+    """Version, mode, security state, configured sign-in methods and counts (no secrets)."""
+    state = app_state(request)
+    settings = state.settings
+    is_open, reason = access.open_state(settings, session)
+    count = lambda model: int(session.scalar(select(func.count()).select_from(model)) or 0)  # noqa: E731
+    return {
+        "version": __version__,
+        "mode": settings.mode,
+        "open": is_open,
+        "open_reason": reason,
+        "default_registry": settings.default_registry,
+        "providers": {
+            "local_accounts": settings.local_accounts,
+            "oidc": settings.oidc is not None,
+            "oauth": settings.oauth is not None,
+            "ldap": settings.ldap is not None,
+            "proxy": settings.proxy is not None,
+            "admin_token": settings.admin_token is not None,
+        },
+        "oidc_issuer": settings.oidc.issuer if settings.oidc else None,
+        "ldap_url": settings.ldap.url if settings.ldap else None,
+        "counts": {
+            "registries": count(m.Registry),
+            "skills": count(m.Skill),
+            "versions": count(m.SkillVersion),
+            "users": count(m.User),
+            "tokens": count(m.ApiToken),
+        },
+        "schema_revision": db.current_revision(session.get_bind()),  # type: ignore[arg-type]
+        "max_body_mb": settings.max_body_mb,
+        "session_ttl_hours": settings.session_ttl_hours,
+    }
+
+
+@router.put("/security")
+def set_security(
+    request: Request, session: SessionDep, admin: AdminDep, body: Annotated[dict[str, Any], Body()]
+) -> dict[str, Any]:
+    """Switch between open and secured mode from the dashboard.
+
+    Securing needs a way to log in afterwards (an active administrator account, the admin token or an
+    identity provider); re-opening needs ``confirm: true``.
+    """
+    settings = app_state(request).settings
+    if settings.open is not None:
+        raise HTTPException(
+            409, "OWL_SERVER_OPEN is set in the environment and overrides this setting"
+        )
+    want_open = bool(body.get("open"))
+    if want_open:
+        if not body.get("confirm"):
+            raise HTTPException(
+                422, "Re-opening the server removes all access control; send confirm=true"
+            )
+        access.set_flag(session, access.KEY, "false")
+    else:
+        admins = (
+            session.scalar(
+                select(func.count())
+                .select_from(m.User)
+                .where(m.User.is_admin.is_(True), m.User.active.is_(True))
+            )
+            or 0
+        )
+        if not (admins or settings.admin_token or settings.external_providers):
+            raise HTTPException(
+                422, "Create an administrator account first - otherwise nobody could log in"
+            )
+        access.set_flag(session, access.KEY, "true")
+    audit.record(
+        session, admin, "server.open" if want_open else "server.secured", ip=client_ip(request)
+    )
+    session.commit()
+    is_open, reason = access.open_state(settings, session)
+    return {"open": is_open, "reason": reason}

@@ -10,12 +10,15 @@ from fastapi import Depends, Header, HTTPException, Request
 from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
-from owl_server import accounts, security
+from owl_server import access, accounts, external, security
 from owl_server import models as m
 from owl_server.config import Settings
+from owl_server.ldap_auth import LdapService
+from owl_server.oauth import OAuthService
 from owl_server.oidc import OidcService
 from owl_server.permissions import (
     ANONYMOUS,
+    OPEN,
     Principal,
     at_least,
     effective_role,
@@ -31,6 +34,8 @@ class AppState:
     factory: sessionmaker[Session]
     limiter: RateLimiter
     oidc: OidcService | None = None
+    oauth: OAuthService | None = None
+    ldap: LdapService | None = None
 
 
 def app_state(request: Request) -> AppState:
@@ -54,28 +59,78 @@ def client_ip(request: Request) -> str:
     return request.client.host if request.client else ""
 
 
+def _proxy_principal(request: Request, session: Session, settings: Settings) -> Principal | None:
+    """Identity asserted by a trusted reverse proxy (Kerberos/SPNEGO, SAML, oauth2-proxy, ...).
+
+    The headers count only together with the shared secret; a request that carries the secret header
+    with a wrong value is rejected, one without it is treated as a normal request (and any
+    ``X-Remote-User`` it may contain is ignored).
+    """
+    proxy = settings.proxy
+    assert proxy is not None
+    supplied = request.headers.get(proxy.secret_header)
+    if supplied is None:
+        return None
+    if not security.same(supplied, proxy.secret):
+        raise HTTPException(401, "Invalid proxy credentials")
+    username = (request.headers.get(proxy.user_header) or "").strip()
+    if not username:
+        return None
+    raw = request.headers.get(proxy.groups_header) or ""
+    groups = [g.strip() for g in raw.split(proxy.groups_separator) if g.strip()]
+    try:
+        user = external.provision(
+            session,
+            proxy.mapping,
+            provider="proxy",
+            subject=username,
+            username=username,
+            email=request.headers.get(proxy.email_header) or None,
+            groups=groups,
+            touch=False,
+        )
+    except external.ExternalLoginError as exc:
+        raise HTTPException(exc.status, exc.public) from exc
+    session.commit()
+    return Principal(
+        kind="user",
+        user_id=user.id,
+        username=user.username,
+        is_admin=user.is_admin,
+        memberships=accounts.memberships_of(session, user.id),
+    )
+
+
 def get_principal(
     request: Request, session: SessionDep, authorization: Annotated[str | None, Header()] = None
 ) -> Principal:
-    """Resolve the bearer token (env admin token, API token or login session) to a principal."""
-    if not authorization:
-        return ANONYMOUS
-    scheme, _, secret = authorization.partition(" ")
-    secret = secret.strip()
-    if scheme.lower() != "bearer" or not secret:
-        raise HTTPException(
-            401, "Invalid Authorization header", headers={"WWW-Authenticate": "Bearer"}
-        )
+    """Who is calling: proxy-asserted user, env admin token, API token / session - or, while the
+    server is open, everyone (an administrator)."""
     settings = app_state(request).settings
-    if settings.admin_token and security.same(secret, settings.admin_token):
-        return Principal(kind="bootstrap", username="bootstrap-admin", is_admin=True)
-    principal = accounts.principal_for_token(session, secret)
-    if principal is None:
-        raise HTTPException(
-            401, "Invalid, expired or revoked token", headers={"WWW-Authenticate": "Bearer"}
-        )
-    session.commit()  # last_used_at
-    return principal
+    if settings.proxy:
+        asserted = _proxy_principal(request, session, settings)
+        if asserted is not None:
+            return asserted
+    is_open = access.is_open(settings, session)
+    if authorization:
+        scheme, _, secret = authorization.partition(" ")
+        secret = secret.strip()
+        found: Principal | None = None
+        if scheme.lower() == "bearer" and secret:
+            if settings.admin_token and security.same(secret, settings.admin_token):
+                found = Principal(kind="bootstrap", username="bootstrap-admin", is_admin=True)
+            else:
+                found = accounts.principal_for_token(session, secret)
+                if found is not None:
+                    session.commit()  # last_used_at
+        if found is not None:
+            return found
+        if not is_open:  # in open mode a stale token must not lock anybody out
+            detail = (
+                "Invalid, expired or revoked token" if secret else "Invalid Authorization header"
+            )
+            raise HTTPException(401, detail, headers={"WWW-Authenticate": "Bearer"})
+    return OPEN if is_open else ANONYMOUS
 
 
 PrincipalDep = Annotated[Principal, Depends(get_principal)]

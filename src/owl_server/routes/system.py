@@ -9,7 +9,7 @@ from fastapi import APIRouter, Body, HTTPException, Request
 from fastapi.responses import JSONResponse
 from sqlalchemy import func, select, text
 
-from owl_server import __version__, accounts, audit, db
+from owl_server import __version__, access, accounts, audit, db
 from owl_server import models as m
 from owl_server.deps import (
     AdminDep,
@@ -122,6 +122,15 @@ def create_registry(
     )
     session.commit()
     return _registry_dict(session, settings, registry, "admin")
+
+
+@router.get("/registries/{slug}")
+def get_registry(
+    request: Request, session: SessionDep, principal: PrincipalDep, slug: str
+) -> dict[str, Any]:
+    settings = app_state(request).settings
+    ctx = load_registry(session, settings, principal, slug)
+    return _registry_dict(session, settings, ctx.registry, ctx.role)
 
 
 @router.patch("/registries/{slug}")
@@ -251,3 +260,79 @@ def remove_member(
     audit.record(session, principal, "member.remove", f"{slug}:{username}", ip=client_ip(request))
     session.commit()
     return {"removed": True}
+
+
+# -- first-run setup: from "open" to "secured" --------------------------------------------------
+
+
+def _provider_summary(settings) -> dict[str, Any]:  # type: ignore[no-untyped-def]
+    return {
+        "local_accounts": settings.local_accounts,
+        "oidc": settings.oidc is not None,
+        "oauth": settings.oauth is not None,
+        "ldap": settings.ldap is not None,
+        "proxy": settings.proxy is not None,
+        "admin_token": settings.admin_token is not None,
+    }
+
+
+@router.get("/setup/status")
+def setup_status(request: Request, session: SessionDep) -> dict[str, Any]:
+    """Open to everyone: is the server open, and what is configured? (No secrets.)"""
+    settings = app_state(request).settings
+    is_open, reason = access.open_state(settings, session)
+    users = session.scalar(select(func.count()).select_from(m.User)) or 0
+    admins = (
+        session.scalar(select(func.count()).select_from(m.User).where(m.User.is_admin.is_(True)))
+        or 0
+    )
+    return {
+        "open": is_open,
+        "reason": reason,
+        "users": int(users),
+        "admins": int(admins),
+        "providers": _provider_summary(settings),
+        "version": __version__,
+    }
+
+
+@router.post("/setup/secure", status_code=201)
+def secure_server(
+    request: Request, session: SessionDep, body: Annotated[dict[str, Any], Body()]
+) -> dict[str, Any]:
+    """Turn an open server into a secured one: creates the first administrator and requires
+    authentication from now on. Only possible while the server is open."""
+    state = app_state(request)
+    settings = state.settings
+    if settings.open is True:
+        raise HTTPException(
+            409, "OWL_SERVER_OPEN=true forces open mode; remove it to secure the server"
+        )
+    if not access.is_open(settings, session):
+        raise HTTPException(409, "This server is already secured")
+    if not settings.local_accounts:
+        raise HTTPException(
+            409, "Local accounts are disabled; configure an identity provider instead"
+        )
+    try:
+        user = accounts.create_user(
+            session, str(body.get("username", "")), str(body.get("password", "")), is_admin=True
+        )
+    except accounts.AccountError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    access.set_flag(session, access.KEY, "true")
+    audit.record(session, "open:open-mode", "server.secured", user.username, ip=client_ip(request))
+    secret, row = accounts.create_token(
+        session,
+        name="login session",
+        role="reader",
+        user=user,
+        kind="session",
+        ttl_hours=settings.session_ttl_hours,
+    )
+    session.commit()
+    return {
+        "token": secret,
+        "expires_at": row.expires_at,
+        "user": {"username": user.username, "is_admin": True},
+    }

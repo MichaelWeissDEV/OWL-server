@@ -322,7 +322,7 @@ def test_oidc_user_cannot_log_in_with_a_password_and_disabled_users_are_blocked(
         oidc_client.post(
             "/api/v1/auth/login", json={"username": "olivia", "password": "x" * 14}
         ).status_code
-        == 404
+        == 401
     )
     oidc_client.patch("/api/v1/admin/users/olivia", headers=auth(ADMIN), json={"active": False})
     assert finish(oidc_client, start(oidc_client, idp)).status_code == 403
