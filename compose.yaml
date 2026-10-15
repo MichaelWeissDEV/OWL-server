@@ -1,7 +1,7 @@
 # OWL Server without the dashboard:  PostgreSQL <- OWL API
 #   cp .env.example .env   # set POSTGRES_PASSWORD (everything else is optional)
 #   docker compose up -d --build
-# The dashboard (a separate, optional service) is added in its own compose profile.
+# Optional web dashboard: docker compose --profile dashboard up -d --build  ->  http://127.0.0.1:8080
 name: owl-server
 
 services:
@@ -53,6 +53,24 @@ services:
     deploy:
       resources:
         limits: {memory: 512m}
+
+  dashboard:
+    profiles: [dashboard]        # only started with --profile dashboard; the API never depends on it
+    build: ./dashboard
+    restart: unless-stopped
+    depends_on:
+      api:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:${OWL_DASHBOARD_PORT:-8080}:8080"
+    networks: [default]
+    read_only: true
+    tmpfs: [/tmp, /var/cache/nginx, /var/run]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    deploy:
+      resources:
+        limits: {memory: 128m}
 
 networks:
   backend:

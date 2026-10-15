@@ -30,8 +30,13 @@ controlled place.
 - **Registries** - several registries per server, each public or private, with reader / publisher /
   admin roles.
 - **Three modes** - `public`, `private` or `mixed`.
-- **Authentication** - bootstrap admin token, optional local accounts (Argon2id), API tokens with scopes,
-  optional OpenID Connect (Keycloak and other OIDC providers; authorization code flow with PKCE).
+- **Open by default** - a fresh server has no restrictions; manage everything in the dashboard and
+  press *Secure this server* (or set an admin token / identity provider) when you want access control.
+- **Dashboard** - web UI to browse, diff and import skills and to manage registries, users, tokens,
+  settings and the audit log (`dashboard/`, React + TypeScript, served by nginx with a strict CSP).
+- **Users and identity** - simple built-in accounts (Argon2id), API tokens with scopes, and pluggable
+  providers: OpenID Connect (Keycloak, Entra, ...), OAuth2 (GitHub), LDAP / Active Directory, and
+  Kerberos / SAML through an authenticating reverse proxy. Providers map groups to roles.
 - **Efficient** - ETag / `If-None-Match`, paging, trigram indexes on PostgreSQL.
 - **Operations** - Docker Compose, health and readiness endpoints, Alembic migrations, audit log.
 - **Shared core** - the data model, hashing and validation come from the OWL package, so server and
@@ -41,22 +46,23 @@ controlled place.
 
 ```bash
 git clone https://github.com/MichaelWeissDEV/owl-server.git && cd owl-server
-cp .env.example .env       # set POSTGRES_PASSWORD and OWL_SERVER_ADMIN_TOKEN (see the comments)
-docker compose up -d --build
+cp .env.example .env       # set POSTGRES_PASSWORD (see the comments)
+docker compose --profile dashboard up -d --build   # dashboard on http://127.0.0.1:8080
 curl http://127.0.0.1:8765/api/v1/ready
 ```
 
 Then, from any machine with the OWL CLI:
 
 ```bash
-export OWL_TOKEN=...       # the admin token (or a registry token you created)
+# open server: no token needed; once secured use a token created in the dashboard
+export OWL_TOKEN=...
 owl remote add company http://127.0.0.1:8765 --token-env OWL_TOKEN
 owl push --all -r company
 owl search security -r company
 owl install secure-review -r company
 ```
 
-Put a TLS reverse proxy in front before exposing the server beyond localhost. The database is on an
+The server is open until you secure it - do not expose an open server beyond localhost. Put a TLS reverse proxy in front before exposing the server beyond localhost. The database is on an
 internal network and is never published.
 
 ## Documentation
@@ -73,7 +79,9 @@ uv run ruff check . && uv run ruff format --check . && uv run mypy src && uv run
 OWL_SERVER_TEST_POSTGRES_URL=postgresql://postgres:pw@localhost:55433/owl_server_test uv run pytest
 ```
 
-Layout: `src/owl_server/` (config, models, repository, accounts, oidc, routes, app, cli),
+Dashboard: `cd dashboard && npm ci && npm run dev` (tests: `npm test`, `npm run e2e`).
+
+Layout: `src/owl_server/` (config, models, repository, accounts, external/oidc/oauth/ldap, routes, app, cli), `dashboard/`,
 `src/owl_server/migrations/` (Alembic), `tests/`, `Dockerfile`, `compose.yaml`.
 
 ## License

@@ -1,0 +1,39 @@
+.skip-link {
+  position: absolute;
+  left: -9999px;
+  top: 0;
+  z-index: 1000;
+  padding: 8px 12px;
+  background: var(--mantine-color-body);
+  border: 2px solid var(--mantine-color-owl-6);
+}
+.skip-link:focus {
+  left: 8px;
+  top: 8px;
+}
+.markdown {
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+}
+.markdown pre {
+  overflow-x: auto;
+  padding: 12px;
+  border-radius: 8px;
+  background: var(--mantine-color-default-hover);
+}
+.markdown code {
+  font-family: var(--mantine-font-family-monospace);
+}
+.markdown table {
+  border-collapse: collapse;
+}
+.markdown th,
+.markdown td {
+  border: 1px solid var(--mantine-color-default-border);
+  padding: 4px 8px;
+}
+.markdown h1,
+.markdown h2,
+.markdown h3 {
+  margin-top: 1.2em;
+}
